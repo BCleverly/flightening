@@ -34,6 +34,7 @@ let moveEndHandler = null
 
 const {
   radarTimestamp,
+  radarPath,
   isUpdating: radarUpdating,
   start: startRainViewer,
   stop: stopRainViewer,
@@ -249,7 +250,7 @@ function upsertRadarLayer() {
   }
 }
 
-watch(radarTimestamp, () => upsertRadarLayer())
+watch(radarPath, () => upsertRadarLayer())
 
 onMounted(() => {
   map = new MapLibreMap({
