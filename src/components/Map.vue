@@ -5,7 +5,7 @@ import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&ur
 import { MapboxOverlay } from '@deck.gl/mapbox'
 import { IconLayer, ScatterplotLayer, TextLayer } from '@deck.gl/layers'
 import StatsPanel from './StatsPanel.vue'
-import { useRainViewer } from '../composables/useRainViewer'
+import { useRainViewer, RADAR_TILE_SIZE, RADAR_MAX_ZOOM } from '../composables/useRainViewer'
 import { useOpenSky } from '../composables/useOpenSky'
 import { useAircraftInterpolation } from '../composables/useAircraftInterpolation'
 import { useBlitzortung } from '../composables/useBlitzortung'
@@ -36,10 +36,19 @@ const {
   radarTimestamp,
   radarPath,
   isUpdating: radarUpdating,
+  rateLimited: radarRateLimited,
   start: startRainViewer,
   stop: stopRainViewer,
   tileUrlTemplate,
+  noteTileFailure,
+  isInCooldown,
 } = useRainViewer()
+
+const EMPTY_TILE =
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
+
+let mapErrorHandler = null
+let lastRadarTemplate = null
 
 const {
   aircraftCount,
@@ -217,22 +226,42 @@ function layerLoop() {
   layerRaf = requestAnimationFrame(layerLoop)
 }
 
+function removeRadarLayer() {
+  if (!map) return
+  if (map.getLayer('rainviewer-radar-layer')) map.removeLayer('rainviewer-radar-layer')
+  if (map.getSource('rainviewer-radar')) map.removeSource('rainviewer-radar')
+  lastRadarTemplate = null
+}
+
 function upsertRadarLayer() {
   if (!map || !map.isStyleLoaded()) return
+
+  if (isInCooldown()) {
+    removeRadarLayer()
+    return
+  }
+
   const template = tileUrlTemplate()
-  if (!template) return
+  if (!template) {
+    removeRadarLayer()
+    return
+  }
+
+  // Avoid setTiles() churn — each call invalidates the cache and can trigger a 429 storm
+  if (template === lastRadarTemplate && map.getSource('rainviewer-radar')) return
+  lastRadarTemplate = template
 
   const sourceId = 'rainviewer-radar'
   const layerId = 'rainviewer-radar-layer'
 
   if (map.getSource(sourceId)) {
-    const src = map.getSource(sourceId)
-    src.setTiles([template])
+    map.getSource(sourceId).setTiles([template])
   } else {
     map.addSource(sourceId, {
       type: 'raster',
       tiles: [template],
-      tileSize: 256,
+      tileSize: RADAR_TILE_SIZE,
+      maxzoom: RADAR_MAX_ZOOM,
       attribution: 'RainViewer',
     })
     map.addLayer(
@@ -250,7 +279,7 @@ function upsertRadarLayer() {
   }
 }
 
-watch(radarPath, () => upsertRadarLayer())
+watch([radarPath, radarRateLimited], () => upsertRadarLayer())
 
 onMounted(() => {
   map = new MapLibreMap({
@@ -264,10 +293,30 @@ onMounted(() => {
     attributionControl: {
       compact: true,
     },
+    transformRequest: (url) => {
+      // Stop hammering RainViewer while rate-limited (also avoids CORS-less 429 noise)
+      if (isInCooldown() && url.includes('tilecache.rainviewer.com')) {
+        return { url: EMPTY_TILE }
+      }
+      return { url }
+    },
   })
 
   map.addControl(new NavigationControl({ visualizePitch: true }), 'bottom-right')
   map.addControl(new ScaleControl({ maxWidth: 120 }), 'bottom-left')
+
+  mapErrorHandler = (e) => {
+    const msg = String(e?.error?.message || '')
+    if (!msg.includes('rainviewer') && !msg.includes('tilecache.rainviewer')) return
+    const statusMatch = msg.match(/\((\d{3})\)/)
+    const status = statusMatch ? Number(statusMatch[1]) : null
+    // NetworkError/CORS often means a stripped 429 response
+    if (status === 429 || status === 410 || msg.includes('NetworkError')) {
+      noteTileFailure(status === 410 ? 410 : 429)
+      removeRadarLayer()
+    }
+  }
+  map.on('error', mapErrorHandler)
 
   map.on('load', () => {
     // MapboxOverlay is MapLibre-compatible (same control / camera API)
@@ -322,6 +371,7 @@ onUnmounted(() => {
   stopRainViewer()
   stopLightning()
   if (map && moveEndHandler) map.off('moveend', moveEndHandler)
+  if (map && mapErrorHandler) map.off('error', mapErrorHandler)
   if (deckOverlay && map) {
     try {
       map.removeControl(deckOverlay)
@@ -344,6 +394,7 @@ onUnmounted(() => {
       :lightning-count="strikesLast60s"
       :radar-updating="radarUpdating"
       :radar-timestamp="radarTimestamp"
+      :radar-rate-limited="radarRateLimited"
       :lightning-connected="lightningConnected"
       :aircraft-loading="aircraftLoading"
       :aircraft-updated-at="lastFetchAt"

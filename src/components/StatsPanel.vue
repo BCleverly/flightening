@@ -6,6 +6,7 @@ const props = defineProps({
   lightningCount: { type: Number, default: 0 },
   radarUpdating: { type: Boolean, default: false },
   radarTimestamp: { type: Number, default: null },
+  radarRateLimited: { type: Boolean, default: false },
   lightningConnected: { type: Boolean, default: false },
   aircraftLoading: { type: Boolean, default: false },
   /** Epoch ms — last successful OpenSky aircraft poll */
@@ -156,13 +157,21 @@ const lastClock = computed(() => formatClock(props.aircraftUpdatedAt))
             <span
               class="inline-block h-2 w-2 rounded-full transition-all duration-500"
               :class="
-                radarUpdating
-                  ? 'animate-pulse bg-[var(--accent-amber)] shadow-[0_0_10px_rgba(251,191,36,0.9)]'
-                  : 'bg-sky-400/80'
+                radarRateLimited
+                  ? 'bg-rose-400'
+                  : radarUpdating
+                    ? 'animate-pulse bg-[var(--accent-amber)] shadow-[0_0_10px_rgba(251,191,36,0.9)]'
+                    : 'bg-sky-400/80'
               "
-              :title="radarUpdating ? 'Refreshing radar…' : 'Radar up to date'"
+              :title="
+                radarRateLimited
+                  ? 'Radar paused (rate-limited)'
+                  : radarUpdating
+                    ? 'Refreshing radar…'
+                    : 'Radar up to date'
+              "
             />
-            {{ formatRadarTime(radarTimestamp) }}
+            {{ radarRateLimited ? 'paused' : formatRadarTime(radarTimestamp) }}
           </dd>
         </div>
       </dl>
