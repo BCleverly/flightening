@@ -1,18 +1,27 @@
 import { shallowRef, watch, onUnmounted } from 'vue'
 import { destinationPoint } from '../utils/aircraft'
 
-/** Fade OpenSky position snaps into the dead-reckoned track */
+/** Fade position snaps into the dead-reckoned track */
 const CORRECTION_MS = 2500
 /** Keep coasting on last velocity if a poll is late */
 const MAX_COAST_MS = 45_000
+/** Max breadcrumb points retained per aircraft */
+const MAX_TRAIL_POINTS = 180
+/** Ignore successive poll points closer than this (meters) */
+const MIN_TRAIL_SPACING_M = 120
+/** Drop trails unused for this long */
+const TRAIL_TTL_MS = 15 * 60_000
 
 /**
  * Continuous aircraft motion via ground-speed dead reckoning, with soft
- * corrections when a new OpenSky snapshot arrives (no pause between polls).
+ * corrections when a new snapshot arrives. Also records poll breadcrumbs so
+ * a selected aircraft can render its recent path.
  */
 export function useAircraftInterpolation(latestTargets) {
   const frameAircraft = shallowRef([])
   const track = new Map()
+  /** @type {Map<string, { points: number[][], touchedAt: number }>} */
+  const trails = new Map()
 
   let rafId = 0
   let running = false
@@ -22,12 +31,51 @@ export function useAircraftInterpolation(latestTargets) {
     return Math.max(0, 1 - (now - errBorn) / CORRECTION_MS)
   }
 
+  function approxDistanceM(a, b) {
+    const [lon1, lat1] = a
+    const [lon2, lat2] = b
+    const dy = (lat2 - lat1) * 111_320
+    const dx = (lon2 - lon1) * 111_320 * Math.cos((lat1 * Math.PI) / 180)
+    return Math.hypot(dx, dy)
+  }
+
+  function appendTrailPoint(id, lon, lat, alt) {
+    const now = Date.now()
+    let entry = trails.get(id)
+    if (!entry) {
+      entry = { points: [], touchedAt: now }
+      trails.set(id, entry)
+    }
+    entry.touchedAt = now
+    const point = [lon, lat, alt]
+    const last = entry.points[entry.points.length - 1]
+    if (last && approxDistanceM(last, point) < MIN_TRAIL_SPACING_M) {
+      // Refresh the tip so altitude stays current without adding noise
+      last[0] = lon
+      last[1] = lat
+      last[2] = alt
+      return
+    }
+    entry.points.push(point)
+    if (entry.points.length > MAX_TRAIL_POINTS) {
+      entry.points.splice(0, entry.points.length - MAX_TRAIL_POINTS)
+    }
+  }
+
+  function pruneTrails(nowMs = Date.now()) {
+    for (const [id, entry] of trails) {
+      if (nowMs - entry.touchedAt > TRAIL_TTL_MS) trails.delete(id)
+    }
+  }
+
   function upsertFromTargets(targets) {
     const now = performance.now()
     const seen = new Set()
 
     for (const [id, t] of targets) {
       seen.add(id)
+      appendTrailPoint(id, t.longitude, t.latitude, t.altitude)
+
       const existing = track.get(id)
 
       if (!existing) {
@@ -55,7 +103,6 @@ export function useAircraftInterpolation(latestTargets) {
         continue
       }
 
-      // Where the icon is on screen right now (DR + fading snap correction)
       const ageSec = Math.max(0, (now - existing.reportTime) / 1000)
       const [predLon, predLat] = destinationPoint(
         existing.reportLon,
@@ -92,6 +139,8 @@ export function useAircraftInterpolation(latestTargets) {
     for (const id of track.keys()) {
       if (!seen.has(id)) track.delete(id)
     }
+
+    pruneTrails()
   }
 
   function sample(now) {
@@ -130,7 +179,6 @@ export function useAircraftInterpolation(latestTargets) {
   }
 
   function tick(now) {
-    // Cap huge background-tab gaps so we don't teleport
     if (lastFrameAt && now - lastFrameAt > 2000) {
       const gap = now - lastFrameAt
       for (const a of track.values()) {
@@ -156,6 +204,28 @@ export function useAircraftInterpolation(latestTargets) {
     rafId = 0
   }
 
+  /**
+   * Returns a copy of breadcrumb positions for an aircraft, optionally
+   * extending the tip to the live animated position.
+   */
+  function getTrailPath(id, livePosition = null) {
+    const entry = trails.get(id)
+    if (!entry?.points?.length && !livePosition) return null
+    const path = entry?.points?.length ? entry.points.map((p) => [...p]) : []
+    if (livePosition) {
+      const tip = path[path.length - 1]
+      if (
+        !tip ||
+        tip[0] !== livePosition[0] ||
+        tip[1] !== livePosition[1] ||
+        tip[2] !== livePosition[2]
+      ) {
+        path.push([...livePosition])
+      }
+    }
+    return path.length >= 2 ? path : null
+  }
+
   const stopWatch = watch(
     latestTargets,
     (targets) => {
@@ -169,5 +239,5 @@ export function useAircraftInterpolation(latestTargets) {
     stopWatch()
   })
 
-  return { frameAircraft, start, stop }
+  return { frameAircraft, getTrailPath, start, stop }
 }

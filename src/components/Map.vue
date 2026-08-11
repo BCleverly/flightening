@@ -1,9 +1,9 @@
 <script setup>
-import { ref, watch, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { Map as MapLibreMap, NavigationControl, ScaleControl, setWorkerUrl } from 'maplibre-gl'
 import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url'
 import { MapboxOverlay } from '@deck.gl/mapbox'
-import { IconLayer, ScatterplotLayer, TextLayer } from '@deck.gl/layers'
+import { IconLayer, ScatterplotLayer, TextLayer, PathLayer } from '@deck.gl/layers'
 import StatsPanel from './StatsPanel.vue'
 import { useRainViewer, RADAR_TILE_SIZE, RADAR_MAX_ZOOM } from '../composables/useRainViewer'
 import { useOpenSky } from '../composables/useOpenSky'
@@ -69,8 +69,20 @@ const {
   stop: stopLightning,
 } = useBlitzortung()
 
-const { frameAircraft, start: startInterpolation, stop: stopInterpolation } =
+const { frameAircraft, getTrailPath, start: startInterpolation, stop: stopInterpolation } =
   useAircraftInterpolation(latestTargets)
+
+const selectedAircraftId = ref(null)
+
+const selectedAircraft = computed(() => {
+  const id = selectedAircraftId.value
+  if (!id) return null
+  return frameAircraft.value.find((a) => a.id === id) ?? null
+})
+
+function clearSelection() {
+  selectedAircraftId.value = null
+}
 
 function getViewportBounds() {
   if (!map) return null
@@ -146,6 +158,51 @@ function buildLayers() {
     characterSet: 'auto',
   })
 
+  const selectedId = selectedAircraftId.value
+  const selected = selectedId
+    ? frameAircraft.value.find((a) => a.id === selectedId)
+    : null
+  const trailPath =
+    selectedId && selected
+      ? getTrailPath(selectedId, selected.position)
+      : selectedId
+        ? getTrailPath(selectedId)
+        : null
+
+  const trailLayer = new PathLayer({
+    id: 'aircraft-trail',
+    data: trailPath ? [{ path: trailPath }] : [],
+    pickable: false,
+    widthUnits: 'pixels',
+    widthMinPixels: 2,
+    widthMaxPixels: 5,
+    jointRounded: true,
+    capRounded: true,
+    getPath: (d) => d.path,
+    getWidth: 3,
+    getColor: [56, 189, 248, 210],
+    updateTriggers: {
+      getPath: now,
+    },
+  })
+
+  const selectionHalo = new ScatterplotLayer({
+    id: 'aircraft-selection',
+    data: selected ? [selected] : [],
+    pickable: false,
+    stroked: true,
+    filled: false,
+    radiusUnits: 'pixels',
+    lineWidthUnits: 'pixels',
+    getPosition: (d) => d.position,
+    getRadius: 18,
+    getLineWidth: 2,
+    getLineColor: [255, 255, 255, 220],
+    updateTriggers: {
+      getPosition: now,
+    },
+  })
+
   const aircraftLayer = new IconLayer({
     id: 'aircraft',
     data: frameAircraft.value,
@@ -153,7 +210,7 @@ function buildLayers() {
     billboard: true,
     sizeScale: 1,
     sizeMinPixels: 14,
-    sizeMaxPixels: 36,
+    sizeMaxPixels: 40,
     getIcon: () => ({
       url: PLANE_ICON_URL,
       width: 64,
@@ -162,14 +219,15 @@ function buildLayers() {
       mask: true,
     }),
     getPosition: (d) => d.position,
-    getSize: 22,
-    getColor: (d) => d.color,
-    // OpenSky true_track: degrees clockwise from north; icon nose points up
+    getSize: (d) => (d.id === selectedId ? 30 : 22),
+    getColor: (d) =>
+      d.id === selectedId ? [255, 255, 255, 255] : d.color,
     getAngle: (d) => -d.heading,
     updateTriggers: {
       getPosition: now,
       getAngle: now,
-      getColor: lastFetchAt.value,
+      getColor: `${lastFetchAt.value}-${selectedId}`,
+      getSize: selectedId,
     },
   })
 
@@ -211,8 +269,16 @@ function buildLayers() {
     },
   })
 
-  // Airports under dynamic layers so planes/lightning stay on top
-  return [airportPins, airportLabels, lightningGlow, lightningCore, aircraftLayer]
+  // Airports under dynamic layers; trail under selected aircraft
+  return [
+    airportPins,
+    airportLabels,
+    lightningGlow,
+    lightningCore,
+    trailLayer,
+    selectionHalo,
+    aircraftLayer,
+  ]
 }
 
 function syncDeckLayers() {
@@ -349,6 +415,17 @@ onMounted(() => {
         }
         return null
       },
+      onClick: ({ object, layer }) => {
+        if (layer?.id === 'aircraft' && object?.id) {
+          selectedAircraftId.value =
+            selectedAircraftId.value === object.id ? null : object.id
+          return
+        }
+        // Click empty map / non-aircraft → clear trail selection
+        if (!object || layer?.id !== 'aircraft') {
+          selectedAircraftId.value = null
+        }
+      },
     })
     map.addControl(deckOverlay)
 
@@ -400,5 +477,34 @@ onUnmounted(() => {
       :aircraft-updated-at="lastFetchAt"
       :aircraft-next-at="nextFetchAt"
     />
+
+    <div
+      v-if="selectedAircraftId"
+      class="pointer-events-none absolute bottom-6 left-1/2 z-10 w-[min(100vw-2rem,22rem)] -translate-x-1/2"
+    >
+      <div
+        class="pointer-events-auto flex items-center justify-between gap-3 rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-bg)] px-4 py-3 shadow-2xl backdrop-blur-xl"
+      >
+        <div class="min-w-0">
+          <div class="font-mono text-sm font-medium text-[var(--accent-cyan)]">
+            {{ selectedAircraft?.callsign || selectedAircraftId }}
+          </div>
+          <div class="truncate text-xs text-[var(--text-muted)]">
+            {{
+              selectedAircraft
+                ? `${Math.round(selectedAircraft.altitude)} m · trail while watched`
+                : 'Waiting for aircraft…'
+            }}
+          </div>
+        </div>
+        <button
+          type="button"
+          class="shrink-0 rounded-lg border border-white/10 px-2.5 py-1 font-mono text-[11px] uppercase tracking-wide text-[var(--text-muted)] transition hover:border-white/25 hover:text-[var(--text-primary)]"
+          @click="clearSelection"
+        >
+          Clear
+        </button>
+      </div>
+    </div>
   </div>
 </template>
