@@ -11,14 +11,4 @@ export default defineConfig({
   worker: {
     format: 'es',
   },
-  server: {
-    proxy: {
-      // OpenSky blocks browser CORS — proxy through Vite in dev
-      '/api/opensky': {
-        target: 'https://opensky-network.org',
-        changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api\/opensky/, '/api'),
-      },
-    },
-  },
 })
